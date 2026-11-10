@@ -117,17 +117,37 @@
   }
 
   // ---------- API ----------
+  // O servidor tem pouca memória e as lojas podem demorar: cada tentativa tem tempo limite
+  // e, se falhar por rede/tempo/erro 5xx, repetimos uma vez (as consultas são seguras de repetir).
+  const TEMPO_LIMITE_MS = 25000;
+  const TENTATIVAS = 2;
+  const esperar = (ms) => new Promise((ok) => setTimeout(ok, ms));
+
   async function requisicao(caminho, opcoes) {
-    let r;
-    try {
-      r = await fetch(API + caminho, opcoes);
-    } catch {
-      throw new Error("Não consegui me comunicar com o servidor. Verifique se ele está em execução (python app.py).");
+    let ultimoErro;
+    for (let tentativa = 1; tentativa <= TENTATIVAS; tentativa++) {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), TEMPO_LIMITE_MS);
+      try {
+        const r = await fetch(API + caminho, { ...opcoes, signal: ctrl.signal });
+        let dados = {};
+        try { dados = await r.json(); } catch {}
+        if (r.ok) return dados;
+        const erro = new Error(dados.erro || `Erro ${r.status}`);
+        if (r.status < 500) throw erro;          // erro do pedido (4xx): repetir não adianta
+        ultimoErro = erro;
+      } catch (e) {
+        if (e.name === "AbortError") {
+          ultimoErro = new Error("O servidor demorou demais para responder. Tente novamente em instantes.");
+        } else if (e instanceof TypeError) {
+          ultimoErro = new Error("Não consegui me comunicar com o servidor. Verifique se ele está em execução (python app.py).");
+        } else {
+          throw e;
+        }
+      } finally { clearTimeout(timer); }
+      if (tentativa < TENTATIVAS) await esperar(1200);
     }
-    let dados = {};
-    try { dados = await r.json(); } catch {}
-    if (!r.ok) throw new Error(dados.erro || `Erro ${r.status}`);
-    return dados;
+    throw ultimoErro;
   }
   const chamar = (caminho, corpo) => requisicao(caminho, {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(corpo),
@@ -272,6 +292,10 @@
   async function executar(carregandoTxt, fn) {
     const carregando = addMsg("bot", carregandoTxt);
     setOcupado(true);
+    // se demorar, avisa que ainda está trabalhando (em vez de parecer travado)
+    const aviso = setTimeout(() => {
+      carregando.textContent = carregandoTxt + "\n⏳ As lojas estão demorando um pouco; continuo tentando…";
+    }, 6000);
     try {
       const resultado = await fn();
       carregando.replaceChildren(resultado);
@@ -279,7 +303,7 @@
     } catch (e) {
       carregando.textContent = "⚠️ " + e.message;
       return false;
-    } finally { setOcupado(false); rolar(); }
+    } finally { clearTimeout(aviso); setOcupado(false); rolar(); }
   }
 
   async function recomendarComPC(categoria) {
